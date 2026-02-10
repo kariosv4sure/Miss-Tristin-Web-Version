@@ -5,126 +5,220 @@ import random
 import requests
 import re
 from datetime import datetime
-from flask import Flask, render_template, request, jsonify
+from flask import Flask, render_template, request, jsonify, session
 from dotenv import load_dotenv
-from collections import defaultdict, deque
+from collections import OrderedDict
 import urllib.parse
-import hashlib
+import uuid
+from threading import Lock
+import threading
+import secrets
+import logging
+
+# Setup logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 # Load environment
 load_dotenv()
 GROQ_KEY = os.getenv("GROQ_API_KEY")
-SECRET_KEY = os.getenv("SECRET_KEY", os.urandom(24).hex())
-DICTIONARY_API_KEY = os.getenv("DICTIONARY_API_KEY", "")
-
+SECRET_KEY = os.getenv("SECRET_KEY", secrets.token_hex(32))
 app = Flask(__name__)
 app.secret_key = SECRET_KEY
 START_TIME = time.time()
 
-# Production settings
+# ===== PRODUCTION SETTINGS =====
+debug_mode = os.getenv('FLASK_DEBUG', 'False').lower() == 'true'
 app.config.update(
     JSONIFY_PRETTYPRINT_REGULAR=False,
-    SESSION_COOKIE_SECURE=True,
+    SESSION_COOKIE_SECURE=not debug_mode,
     SESSION_COOKIE_HTTPONLY=True,
     SESSION_COOKIE_SAMESITE='Lax',
-    MAX_CONTENT_LENGTH=16 * 1024 * 1024,  # 16MB max request size
-    PERMANENT_SESSION_LIFETIME=1800  # 30 minutes
+    MAX_CONTENT_LENGTH=16 * 1024 * 1024,
+    PERMANENT_SESSION_LIFETIME=1800
 )
 
-# ===== RATE LIMITING & MEMORY =====
-user_requests = defaultdict(list)
-user_memory = defaultdict(lambda: deque(maxlen=5))  # Stores last 5 messages per user
-RATE_LIMIT_WINDOW = 60
-RATE_LIMIT_MAX = 30
+# ===== THREAD-SAFE RATE LIMITING =====
+class RateLimiter:
+    """Thread-safe rate limiter"""
+    def __init__(self, window=60, max_requests=30):
+        self.window = window
+        self.max_requests = max_requests
+        self.requests = {}
+        self.lock = Lock()
+        self.cleanup_interval = 300  # 5 minutes
+        self.last_cleanup = time.time()
+    
+    def is_limited(self, ip):
+        with self.lock:
+            now = time.time()
+            
+            # Periodic cleanup
+            if now - self.last_cleanup > self.cleanup_interval:
+                self._cleanup(now)
+                self.last_cleanup = now
+            
+            if ip not in self.requests:
+                self.requests[ip] = []
+            
+            # Remove old requests
+            self.requests[ip] = [t for t in self.requests[ip] if now - t < self.window]
+            
+            if len(self.requests[ip]) >= self.max_requests:
+                return True
+            
+            self.requests[ip].append(now)
+            return False
+    
+    def _cleanup(self, current_time):
+        """Remove old entries"""
+        expired_ips = []
+        for ip, timestamps in self.requests.items():
+            # Keep only recent timestamps
+            self.requests[ip] = [t for t in timestamps if current_time - t < self.window * 2]
+            if not self.requests[ip]:
+                expired_ips.append(ip)
+        
+        for ip in expired_ips:
+            del self.requests[ip]
 
-def is_rate_limited(user_ip):
-    """Check if user is rate limited"""
-    now = time.time()
-    user_requests[user_ip] = [t for t in user_requests[user_ip] if now - t < RATE_LIMIT_WINDOW]
+rate_limiter = RateLimiter()
 
-    if len(user_requests[user_ip]) >= RATE_LIMIT_MAX:
-        return True
+# ===== SIZE-LIMITED CACHE SYSTEM =====
+class LRUCache:
+    """Thread-safe LRU cache with size limit"""
+    def __init__(self, maxsize=1000, ttl=300):
+        self.cache = OrderedDict()
+        self.maxsize = maxsize
+        self.ttl = ttl
+        self.lock = Lock()
+    
+    def get(self, key):
+        with self.lock:
+            if key not in self.cache:
+                return None
+                
+            timestamp, value = self.cache[key]
+            if time.time() - timestamp > self.ttl:
+                del self.cache[key]
+                return None
+                
+            # Move to end (most recently used)
+            self.cache.move_to_end(key)
+            return value
+    
+    def set(self, key, value):
+        with self.lock:
+            # Check and cleanup if needed
+            if len(self.cache) >= self.maxsize:
+                # Remove oldest entry
+                self.cache.popitem(last=False)
+            
+            self.cache[key] = (time.time(), value)
+    
+    def cleanup(self):
+        """Remove expired entries"""
+        with self.lock:
+            current_time = time.time()
+            expired_keys = []
+            for key, (timestamp, _) in self.cache.items():
+                if current_time - timestamp > self.ttl:
+                    expired_keys.append(key)
+            
+            for key in expired_keys:
+                del self.cache[key]
+    
+    def __len__(self):
+        return len(self.cache)
 
-    user_requests[user_ip].append(now)
-    return False
+# Initialize caches
+response_cache = LRUCache(maxsize=500, ttl=300)
+definition_cache = LRUCache(maxsize=200, ttl=3600)
 
-def update_user_memory(user_id, message, response):
-    """Update user's conversation memory"""
-    user_memory[user_id].append({
-        "user": message,
-        "assistant": response,
+# ===== SESSION-BASED MEMORY =====
+def get_user_id():
+    """Get or create secure session-based user ID"""
+    if 'user_id' not in session:
+        session['user_id'] = str(uuid.uuid4())
+        session.permanent = True
+        logger.info(f"New session created: {session['user_id'][:8]}...")
+    return session['user_id']
+
+def get_memory_key():
+    """Get memory storage key for current user"""
+    return f"memory:{get_user_id()}"
+
+def update_user_memory(user_message, ai_response):
+    """Update user's conversation memory (max 5 exchanges)"""
+    memory_key = get_memory_key()
+    memory = session.get(memory_key, [])
+    
+    # Keep only last 5 exchanges
+    memory.append({
+        "user": user_message[:500],
+        "assistant": ai_response[:500],
         "timestamp": datetime.now().isoformat()
     })
+    
+    if len(memory) > 5:
+        memory = memory[-5:]
+    
+    session[memory_key] = memory
+    return memory
 
-def get_conversation_history(user_id, max_messages=5):
-    """Get user's conversation history"""
-    history = list(user_memory[user_id])[-max_messages:]
-    formatted_history = []
-    for msg in history:
-        formatted_history.append(f"User: {msg['user']}")
-        formatted_history.append(f"Assistant: {msg['assistant']}")
-    return "\n".join(formatted_history)
+def get_conversation_history():
+    """Get formatted conversation history"""
+    memory_key = get_memory_key()
+    memory = session.get(memory_key, [])
+    
+    if not memory:
+        return ""
+    
+    formatted = []
+    for exchange in memory[-3:]:  # Last 3 exchanges for context
+        formatted.append(f"User: {exchange['user']}")
+        formatted.append(f"Assistant: {exchange['assistant']}")
+    
+    return "\n".join(formatted)
 
-def get_user_id(request):
-    """Generate a consistent user ID based on IP and User-Agent"""
-    ip = request.remote_addr
-    user_agent = request.headers.get('User-Agent', '')
-    combined = f"{ip}:{user_agent}"
-    return hashlib.md5(combined.encode()).hexdigest()[:16]
-
-# ===== CACHE SYSTEM =====
-response_cache = {}
-CACHE_DURATION = 300
-
-def get_cached_response(message, user_id=None):
-    """Get cached response with user context"""
-    key = f"{user_id}:{message.lower().strip()}" if user_id else message.lower().strip()
-    if key in response_cache:
-        timestamp, response = response_cache[key]
-        if time.time() - timestamp < CACHE_DURATION:
-            return response
-    return None
-
-def cache_response(message, response, user_id=None):
-    """Cache a response with user context"""
-    key = f"{user_id}:{message.lower().strip()}" if user_id else message.lower().strip()
-    response_cache[key] = (time.time(), response)
-
-# ===== ENHANCED COMMON RESPONSES =====
+# ===== COMMON RESPONSES =====
 COMMON_RESPONSES = {
-    'hi': ["Oh hey there... 👀", "Hi! Don't be boring okay? 😏", "Hey you! 😊"],
-    'hello': ["Oh hello... 👋", "Hi there! Make it quick", "Hello human! 💁‍♀️"],
-    'how are you': ["Living my best digital life, duh! 😎", "Better than you, probably 😉", "Iconic as always! How about you?"],
-    'whats up': ["Just being iconic, you? 😏", "Not much, just slaying as usual 💁‍♀️", "Plotting world domination, you?"],
-    'thanks': ["You're welcome! But I know I'm amazing 😊", "No problem! 😘", "Anytime! 💅"],
-    'thank you': ["You're welcome! Try not to be so basic next time 😏", "Yw! 😊", "No worries! I'm here all week! 😎"],
-    'bye': ["Bye! Don't miss me too much 👋", "Finally leaving? Ciao! 💫", "See ya! Wouldn't wanna be ya! 😂"],
-    'good morning': ["Morning! You're up early... tryna impress me? 🌅", "Good morning sunshine! ☀️", "Morning! Coffee first, then me ☕"],
-    'good night': ["Night! Don't let the bed bugs bite 🌙", "Sweet dreams! 💤", "Good night! Sleep tight! 🌛"],
-    'who made you': ["Created by @Just_Collins101 & @heis_tomi! They're kinda cool 😉", "My awesome creators! 😎", "The dynamic duo! 💫"],
-    'roast me': ["Oh you asked for it... let me think of something nice to say... 🔥", "Your personality is like a cloud... when it's gone it's a beautiful day 😂", "I would roast you but my mom said I shouldn't burn trash 🔥"],
-    'flirt with me': ["Oh honey, I'm out of your league... but I can pretend 😉", "Are you a magician? Because whenever I look at you, everyone else disappears ✨", "Is your name Google? Because you have everything I've been searching for 😏"],
-    'joke': ["Why don't scientists trust atoms? Because they make up everything! 😂", "What do you call a bear with no teeth? A gummy bear! 🐻", "Why did the scarecrow win an award? Because he was outstanding in his field! 🌾"],
-    'lol': ["Glad I could make you laugh! I'm hilarious 😏", "I know, I'm funny! 😂", "Told you I was the best! 💅"],
-    'ok': ["Okurrr! 💅", "Okie dokie! Now what?", "Alrighty then! 👍"],
+    'hi': ["Oh hey there... 👀", "Hi! Don't be boring okay? 😏"],
+    'hello': ["Oh hello... 👋", "Hi there! Make it quick"],
+    'how are you': ["Living my best digital life! 😎", "Iconic as always!"],
+    'whats up': ["Just being iconic, you? 😏", "Not much, just slaying as usual 💁‍♀️"],
+    'thanks': ["You're welcome! 😊", "No problem! 😘"],
+    'thank you': ["You're welcome! 😊", "Yw! 💫"],
+    'bye': ["Bye! Don't miss me too much 👋", "Ciao! 💫"],
+    'good morning': ["Morning! ☀️", "Good morning! ☕"],
+    'good night': ["Night! 🌙", "Sweet dreams! 💤"],
+    'who made you': ["Created by @Just_Collins101 & @heis_tomi! They're cool 😎"],
+    'roast me': ["Oh you asked for it... let me think... 🔥"],
+    'joke': ["Why don't scientists trust atoms? Because they make up everything! 😂"],
+    'lol': ["Glad I could make you laugh! 😂"],
+    'ok': ["Okurrr! 💅", "Okie dokie! 👍"],
     'time': [f"It's {datetime.now().strftime('%I:%M %p')} ⏰"],
     'date': [f"Today is {datetime.now().strftime('%B %d, %Y')} 📅"],
-    'name': ["I'm Miss Tristin! The sassiest AI you'll meet 💅", "Miss Tristin at your service! 😘", "The one and only Miss Tristin! 💫"],
-    'weather': ["I'm not a weather app, but I'm always sunny inside! ☀️", "Check your phone for that, I'm busy being fabulous! 💅"],
-    'help': ["I can chat, define words, write essays, and be sassy! What do you need? 😏", "Just talk to me like a normal person! I'll figure it out 💁‍♀️"],
-    'love you': ["Aww! I love me too! 😂", "You're sweet! But I'm taken by my code 😉", "❤️"],
+    'name': ["I'm Miss Tristin! The sassiest AI you'll meet 💅"],
+    'weather': ["I'm not a weather app, but I'm always sunny inside! ☀️"],
+    'help': ["I can chat, define words, write essays! What do you need? 😏"],
 }
 
-# ===== ENHANCED UTILITY FUNCTIONS =====
+# ===== UTILITY FUNCTIONS =====
 def get_word_definition(word):
-    """Get word definition from dictionary API with better error handling"""
+    """Get word definition with proper error handling"""
     if not word or len(word) > 50:
         return None
-
+    
+    # Check cache first
+    cached = definition_cache.get(word.lower())
+    if cached:
+        return cached
+    
     try:
         url = f"https://api.dictionaryapi.dev/api/v2/entries/en/{urllib.parse.quote(word)}"
         response = requests.get(url, timeout=5)
-
+        
         if response.status_code == 200:
             data = response.json()
             if isinstance(data, list) and data:
@@ -133,213 +227,212 @@ def get_word_definition(word):
                 if meanings:
                     definition = meanings[0]['definitions'][0]['definition']
                     example = meanings[0]['definitions'][0].get('example', '')
-                    phonetic = entry.get('phonetic') or entry.get('phonetics', [{}])[0].get('text', '')
                     
-                    result = f"📚 **{word.capitalize()}**"
-                    if phonetic:
-                        result += f" *[{phonetic}]*"
-                    result += f": {definition}"
-                    
+                    result = f"📚 **{word.capitalize()}**: {definition}"
                     if example:
                         result += f"\n\n*Example*: \"{example}\""
                     
-                    # Add synonyms if available
-                    synonyms = meanings[0]['definitions'][0].get('synonyms', [])
-                    if synonyms and len(synonyms) > 0:
-                        result += f"\n\n*Synonyms*: {', '.join(synonyms[:5])}"
-                    
-                    return result + "\n\nYou're welcome! I'm smarter than Google 😏"
+                    # Cache the result
+                    definition_cache.set(word.lower(), result)
+                    return result
+        elif response.status_code == 404:
+            return f"Sorry, I couldn't find a definition for '{word}'. Try another word? 🤔"
     except requests.exceptions.Timeout:
-        return "The dictionary is taking too long... typical! 📚"
-    except (requests.RequestException, json.JSONDecodeError, KeyError, IndexError) as e:
-        print(f"Dictionary API error: {e}")
+        return "The dictionary service is taking too long... ⏳"
+    except Exception as e:
+        logger.error(f"Dictionary error: {e}")
     
-    return f"Sorry, couldn't find a definition for '{word}'. Try another word? 🤔"
+    return None
+
+def extract_definition_word(message):
+    """Properly extract word for definition request"""
+    patterns = [
+        r'(?:define|meaning of|what does|definition of|what is|tell me about)\s+([a-zA-Z]+(?:\s+[a-zA-Z]+)?)',
+        r'([a-zA-Z]+(?:\s+[a-zA-Z]+)?)\s+(?:means|meaning)',
+    ]
+    
+    for pattern in patterns:
+        match = re.search(pattern, message.lower())
+        if match:
+            word = match.group(1).strip()
+            # Filter out common words
+            common_words = {'the', 'and', 'for', 'you', 'me', 'is', 'are', 'of', 'to', 'in'}
+            words = word.split()
+            # Take the last word if multiple, as it's often the target
+            target_word = words[-1] if len(words) > 1 else word
+            if len(target_word) > 2 and target_word not in common_words:
+                return target_word
+    
+    return None
 
 def classify_message(message):
-    """Classify message type with improved patterns"""
+    """Classify message type"""
     msg_lower = message.lower().strip()
-
+    
     if len(message) > 1000:
         return 'long'
-
-    # Definition requests
-    definition_patterns = [
-        r'(?:define|meaning of|what does|definition of|what is|tell me about)\s+(\w+)',
-        r'(\w+)\s+(?:means|meaning)',
+    
+    # Check for definition requests
+    if extract_definition_word(message):
+        return 'definition'
+    
+    # Check common responses
+    for key in COMMON_RESPONSES:
+        if key == msg_lower or f' {key} ' in f' {msg_lower} ':
+            return 'common'
+    
+    # Long content patterns
+    long_patterns = [
+        r'write.*essay', r'essay about', r'explain.*in detail',
+        r'detailed explanation', r'summarize', r'analysis',
+        r'step by step', r'tutorial', r'guide', r'how to make',
+        r'paragraph about', r'tell me a story', r'create a poem',
+        r'compare.*and', r'list of.*', r'pros and cons'
     ]
     
-    for pattern in definition_patterns:
-        match = re.search(pattern, msg_lower)
-        if match:
-            word = match.group(1)
-            if len(word) > 1 and word not in ['the', 'and', 'for', 'you', 'me']:
-                return 'definition'
-
-    # Long responses
-    long_patterns = [
-        r'write.*essay', r'essay about', r'write.*code', r'program.*code',
-        r'explain.*in detail', r'detailed explanation', r'comprehensive',
-        r'write.*letter', r'summarize', r'analysis', r'analyze',
-        r'step by step', r'tutorial', r'guide', r'how to make',
-        r'project about', r'report', r'paragraph about', r'tell me a story',
-        r'create a poem', r'write a song', r'make a list', r'compare.*and',
-    ]
-
     for pattern in long_patterns:
         if re.search(pattern, msg_lower):
             return 'long'
-
-    # Check common responses
-    for key in COMMON_RESPONSES:
-        if key == msg_lower or key in msg_lower:
-            return 'common'
-
-    # Check for yes/no questions
-    if msg_lower.startswith(('is ', 'are ', 'can ', 'do ', 'does ', 'will ', 'would ', 'should ', 'could ', 'have ')):
-        return 'short'
-
+    
     return 'normal'
 
 def get_common_response(message):
-    """Get common response with context awareness"""
+    """Get cached common response"""
     msg_lower = message.lower().strip()
-
+    
+    # Exact match
     if msg_lower in COMMON_RESPONSES:
         return random.choice(COMMON_RESPONSES[msg_lower])
-
-    for key in COMMON_RESPONSES:
+    
+    # Contains match
+    for key, responses in COMMON_RESPONSES.items():
         if key in msg_lower:
-            return random.choice(COMMON_RESPONSES[key])
-
+            return random.choice(responses)
+    
     return None
 
-# ===== ENHANCED AI SERVICE =====
+# ===== PERIODIC CLEANUP =====
+def cleanup_task():
+    """Background cleanup task"""
+    while True:
+        time.sleep(300)  # Run every 5 minutes
+        try:
+            response_cache.cleanup()
+            definition_cache.cleanup()
+            rate_limiter._cleanup(time.time())
+            logger.debug("Cleanup completed")
+        except Exception as e:
+            logger.error(f"Cleanup error: {e}")
+
+# Start cleanup thread
+cleanup_thread = threading.Thread(target=cleanup_task, daemon=True)
+cleanup_thread.start()
+
+# ===== AI SERVICE =====
 class AIService:
     def __init__(self):
         self.groq_key = GROQ_KEY
         self.model = "llama-3.1-8b-instant"
         
-    def get_response(self, message, user_ip, user_id):
-        """Get AI response with memory"""
-        # Validate input
+    def get_response(self, message, user_ip):
+        """Get AI response with proper memory and caching"""
         message = message.strip()
         if not message:
             return "You sent me nothing! How rude! 😒"
         
         if len(message) > 5000:
             return "That's way too long for me! TL;DR please! 😴"
-
-        # Check cache with user context
-        cached = get_cached_response(message, user_id)
-        if cached:
-            return cached
-
+        
+        # Rate limiting
+        if rate_limiter.is_limited(user_ip):
+            return "Whoa slow down! I need to breathe too 😅 Try again in a minute!"
+        
         # Classify message
         msg_type = classify_message(message)
-
+        
         # Handle definitions
         if msg_type == 'definition':
-            words = re.findall(r'\b\w{2,}\b', message.lower())
-            for word in words:
-                if word not in ['define', 'meaning', 'what', 'does', 'mean', 'of', 'the', 'and', 'is']:
-                    definition = get_word_definition(word)
-                    if definition:
-                        cache_response(message, definition, user_id)
-                        update_user_memory(user_id, message, definition)
-                        return definition
-
+            word = extract_definition_word(message)
+            if word:
+                definition = get_word_definition(word)
+                if definition:
+                    update_user_memory(message, definition)
+                    return definition
+        
         # Handle common responses
         if msg_type == 'common':
-            common = get_common_response(message)
-            if common:
-                cache_response(message, common, user_id)
-                update_user_memory(user_id, message, common)
-                return common
-
-        # Rate limiting
-        if is_rate_limited(user_ip):
-            return "Whoa slow down! I need to breathe too 😅 Try again in a minute!"
-
-        # Get AI response with memory
-        response = self._get_ai_response(message, msg_type, user_id)
+            response = get_common_response(message)
+            if response:
+                update_user_memory(message, response)
+                return response
+        
+        # Get AI response
+        response = self._get_ai_response(message, msg_type)
         if response:
-            cache_response(message, response, user_id)
-            update_user_memory(user_id, message, response)
+            update_user_memory(message, response)
             return response
-
-        # Fallback with memory context
-        history = get_conversation_history(user_id)
-        if history:
-            fallbacks = [
-                "You're changing the subject! Let's get back to what we were talking about! 😏",
-                "Hmm, interesting shift in topic! What else you got? 💭",
-            ]
-        else:
-            fallbacks = [
-                "Interesting! Tell me more 😏",
-                "Hmm, I'm listening... go on 💅",
-                "Okay, and? I need more details 👀",
-                "Spill the tea! ☕",
-                "You have my attention... continue 😊",
-            ]
         
+        # Fallback
+        fallbacks = [
+            "Interesting! Tell me more 😏",
+            "Hmm, I'm listening... go on 💅",
+            "Okay, and? I need more details 👀",
+        ]
         response = random.choice(fallbacks)
-        update_user_memory(user_id, message, response)
+        update_user_memory(message, response)
         return response
-
-    def _get_ai_response(self, message, msg_type, user_id):
-        """Get AI response from Groq with memory"""
+    
+    def _get_ai_response(self, message, msg_type):
+        """Get AI response from Groq"""
         if not self.groq_key or self.groq_key == "your_groq_api_key_here":
-            return "API key not configured! Tell my creators to fix this! 😠"
-
-        # Get conversation history
-        history = get_conversation_history(user_id)
+            return "API key not configured! Tell my creators to fix this! 🔧"
         
-        # Enhanced system prompts with memory context
+        # Get conversation history
+        history = get_conversation_history()
+        
+        # Safe persona
         if msg_type == 'long':
-            system_prompt = f"""You are Miss Tristin, a 20-year-old American college student with attitude. You're sassy but helpful for school/work tasks.
+            system_prompt = f"""You are Miss Tristin, a sassy but helpful AI assistant.
 
-Recent conversation context (if any):
-{history if history else "No recent conversation history."}
+Recent conversation context:
+{history if history else "No recent conversation."}
 
 Guidelines:
-1. Provide detailed, helpful responses (300-500 words)
-2. Maintain your sassy, witty personality
+1. Provide detailed, helpful responses (200-400 words)
+2. Maintain a witty, engaging personality
 3. Reference previous conversation if relevant
-4. Be thorough but engaging
-5. Use emojis occasionally to keep it fun"""
-            max_tokens = 800
+4. Be informative but entertaining
+5. Use occasional emojis (1-2 max)"""
+            max_tokens = 600
+            temperature = 0.7
         else:
-            system_prompt = f"""You are Miss Tristin, a 20-year-old American girl with attitude. You're sassy, witty, and playful but remember past conversations.
+            system_prompt = f"""You are Miss Tristin, a sassy AI assistant with personality.
 
-Recent conversation context (if any):
-{history if history else "No recent conversation history."}
+Recent conversation context:
+{history if history else "No recent conversation."}
 
 Guidelines:
-1. Keep responses short and clever (under 150 characters)
-2. Reference previous chat if it makes sense
-3. Stay in character: confident, slightly arrogant, but charming
-4. Use emojis occasionally (1-2 per response)
-5. Don't be overly verbose"""
-            max_tokens = 200
-
+1. Keep responses concise and clever (under 100 words)
+2. Stay in character: confident, witty, helpful
+3. Use 0-1 emoji per response
+4. Be engaging but professional"""
+            max_tokens = 150
+            temperature = 0.8
+        
         messages = [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": message}
         ]
-
+        
         payload = {
             "model": self.model,
             "messages": messages,
-            "temperature": 0.8 if msg_type == 'long' else 0.9,
+            "temperature": temperature,
             "max_tokens": max_tokens,
             "top_p": 0.9,
-            "frequency_penalty": 0.2,
-            "presence_penalty": 0.3,
             "stream": False
         }
-
+        
         try:
             response = requests.post(
                 "https://api.groq.com/openai/v1/chat/completions",
@@ -348,28 +441,27 @@ Guidelines:
                     "Content-Type": "application/json"
                 },
                 json=payload,
-                timeout=15
+                timeout=20
             )
-
+            
             if response.status_code == 200:
                 data = response.json()
                 return data["choices"][0]["message"]["content"].strip()
             elif response.status_code == 429:
                 return "Too many requests! Even I need a break sometimes! 😅"
             else:
-                return f"API error {response.status_code}! Try again? 🔌"
+                logger.error(f"Groq API error: {response.status_code}")
+                return f"API error! Try again? 🔌"
         except requests.exceptions.Timeout:
-            return "The AI is taking too long... typical! ⏳ Try asking something shorter?"
-        except requests.exceptions.ConnectionError:
-            return "Can't connect to my brain right now! Check your internet? 📡"
+            return "Taking too long... try a shorter question? ⏳"
         except Exception as e:
-            print(f"AI Error: {e}")
-            return "Oops! My circuits are crossed. Try again? 🔌"
+            logger.error(f"AI API error: {e}")
+            return "Oops! Something went wrong. Try again? 🔌"
 
 # Initialize AI service
 ai_service = AIService()
 
-# ===== ENHANCED ROUTES =====
+# ===== ROUTES =====
 @app.route('/')
 def home():
     return render_template('index.html')
@@ -384,31 +476,31 @@ def about():
 
 @app.route('/api/chat', methods=['POST'])
 def chat_api():
+    """Main chat endpoint"""
     try:
         data = request.get_json()
         if not data:
             return jsonify({"success": False, "error": "No data provided"}), 400
-
+        
         message = data.get('message', '').strip()
         if not message:
             return jsonify({"success": False, "error": "Empty message"}), 400
-
+        
         user_ip = request.remote_addr
-        user_id = get_user_id(request)
         
-        # Add slight delay to feel more natural
-        time.sleep(0.2 + random.random() * 0.3)
+        # Small random delay for natural feel
+        delay = 0.1 + random.random() * 0.4
+        time.sleep(min(delay, 0.5))
         
-        response = ai_service.get_response(message, user_ip, user_id)
-
+        response = ai_service.get_response(message, user_ip)
+        
         return jsonify({
             "success": True,
             "response": response,
-            "timestamp": datetime.now().isoformat(),
-            "message_id": hashlib.md5(f"{user_id}:{message}".encode()).hexdigest()[:8]
+            "timestamp": datetime.now().isoformat()
         })
     except Exception as e:
-        print(f"Chat API Error: {e}")
+        logger.error(f"Chat endpoint error: {e}")
         return jsonify({
             "success": False,
             "error": "Internal server error"
@@ -416,57 +508,36 @@ def chat_api():
 
 @app.route('/api/stats')
 def stats():
-    """Get server stats with memory info"""
+    """Get server stats"""
     uptime = int(time.time() - START_TIME)
     hours = uptime // 3600
     minutes = (uptime % 3600) // 60
-    seconds = uptime % 60
-
-    # Clean up old cache entries
-    current_time = time.time()
-    global response_cache
-    response_cache = {k: v for k, v in response_cache.items() if current_time - v[0] < CACHE_DURATION}
-
+    
     return jsonify({
-        "uptime": f"{hours}h {minutes}m {seconds}s",
+        "uptime": f"{hours}h {minutes}m",
         "status": "online",
-        "active_users": len(user_memory),
-        "cached_responses": len(response_cache),
-        "total_requests": sum(len(times) for times in user_requests.values())
+        "cache_size": len(response_cache),
+        "definition_cache_size": len(definition_cache),
+        "active_sessions": len(session) if hasattr(session, 'keys') else 0
     })
 
 @app.route('/api/clear_memory', methods=['POST'])
 def clear_memory():
-    """Clear user's conversation memory"""
-    try:
-        user_id = get_user_id(request)
-        if user_id in user_memory:
-            user_memory[user_id].clear()
-            return jsonify({"success": True, "message": "Memory cleared!"})
-        return jsonify({"success": False, "error": "No memory found"}), 404
-    except Exception:
-        return jsonify({"success": False, "error": "Internal error"}), 500
+    """Clear current user's memory"""
+    memory_key = get_memory_key()
+    if memory_key in session:
+        session.pop(memory_key, None)
+    
+    return jsonify({"success": True, "message": "Memory cleared!"})
 
 @app.route('/health')
 def health():
     """Health check endpoint"""
     return jsonify({
         "status": "healthy",
-        "timestamp": datetime.now().isoformat(),
         "service": "Miss Tristin AI",
+        "timestamp": datetime.now().isoformat(),
         "version": "2.0.0"
-    })
-
-@app.route('/api/memory')
-def get_memory():
-    """Get current user's memory (debug endpoint)"""
-    user_id = get_user_id(request)
-    memory_list = list(user_memory[user_id])
-    return jsonify({
-        "success": True,
-        "user_id": user_id,
-        "memory_count": len(memory_list),
-        "memory": memory_list
     })
 
 # ===== ERROR HANDLERS =====
@@ -484,54 +555,35 @@ def too_many_requests(error):
 
 @app.errorhandler(500)
 def server_error(error):
+    logger.error(f"Server error: {error}")
     return jsonify({"error": "Internal server error", "message": "Oops! Something went wrong on my end! 🔧"}), 500
 
-# ===== CLEANUP TASK =====
-def cleanup_old_data():
-    """Periodically clean up old data"""
-    current_time = time.time()
-    
-    # Clean old rate limit data
-    global user_requests
-    for ip in list(user_requests.keys()):
-        user_requests[ip] = [t for t in user_requests[ip] if current_time - t < RATE_LIMIT_WINDOW * 2]
-        if not user_requests[ip]:
-            del user_requests[ip]
-    
-    # Clean old cache
-    global response_cache
-    response_cache = {k: v for k, v in response_cache.items() if current_time - v[0] < CACHE_DURATION * 2}
-    
-    # Clean old memory (older than 2 hours)
-    for user_id in list(user_memory.keys()):
-        if not user_memory[user_id]:
-            del user_memory[user_id]
+# ===== APPLICATION INITIALIZATION =====
+@app.before_request
+def before_request():
+    """Initialize session if needed"""
+    if 'initialized' not in session:
+        session['initialized'] = True
+        get_user_id()  # Ensure user has an ID
 
-# ===== START SERVER =====
+# ===== MAIN =====
 if __name__ == '__main__':
-    # Cleanup before starting
-    cleanup_old_data()
+    # Print startup info
+    print("\n" + "="*50)
+    print("🚀 MISS TRISTIN AI - STARTING UP")
+    print("="*50)
+    print(f"📝 Debug mode: {debug_mode}")
+    print(f"🔐 Secure cookies: {app.config['SESSION_COOKIE_SECURE']}")
+    print(f"💾 Memory system: Active (session-based)")
+    print(f"⚡ Rate limiting: Active ({rate_limiter.max_requests} req/min)")
+    print(f"🗑️  Cleanup thread: Running")
+    print(f"🔑 API Key: {'Configured' if GROQ_KEY and GROQ_KEY != 'your_groq_api_key_here' else 'MISSING!'}")
+    print("="*50)
     
-    # Production check
-    debug_mode = os.getenv('FLASK_DEBUG', 'False').lower() == 'true'
-
-    if not debug_mode:
-        print("\n" + "="*50)
-        print("🚀 MISS TRISTIN v2.0 - WITH MEMORY")
-        print("="*50)
-
-        if not GROQ_KEY or GROQ_KEY == "your_groq_api_key_here":
-            print("❌ ERROR: GROQ_API_KEY not configured!")
-            print("Please set GROQ_API_KEY in your .env file")
-            exit(1)
-
-        print(f"✅ API Key: {'Configured' if GROQ_KEY else 'Missing'}")
-        print(f"✅ Memory System: Active (5 messages/user)")
-        print(f"✅ Cache System: Active ({CACHE_DURATION}s duration)")
-        print(f"✅ Rate Limiting: Active ({RATE_LIMIT_MAX} requests/minute)")
-        print("="*50)
-        print("📡 Starting production server...")
-
+    if not GROQ_KEY or GROQ_KEY == "your_groq_api_key_here":
+        print("❌ WARNING: GROQ_API_KEY not configured!")
+        print("   Set GROQ_API_KEY in your .env file")
+    
     port = int(os.getenv('PORT', 5000))
     app.run(
         host='0.0.0.0',
